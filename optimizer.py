@@ -7,8 +7,8 @@ from typing import Dict, List
 import time
 import pandas as pd
 
-AIS_RANGE = [9.42, 54, 31, 66.2]
-TDRIVE_RANGE = [116.08, 39.68, 116.77, 40.18]
+range_of_ais = [9.42, 54, 31, 66.2]
+range_of_tdrive = [116.08, 39.68, 116.77, 40.18]
 
 
 def parse_args(args=None):
@@ -43,7 +43,7 @@ class TrajDataset:
     def __init__(self, traj_root, data_name, num_grid):
         self.data_root = os.path.join(traj_root, data_name)
         dataset = data_name.split('/')[0]
-        self.ranges = TDRIVE_RANGE if dataset == "Tdrive" else AIS_RANGE
+        self.ranges = range_of_tdrive if dataset == "Tdrive" or dataset == "geolife" else range_of_ais
         self.num_grid = num_grid
 
     def read_data(self):
@@ -96,27 +96,6 @@ class TrajDataset:
         print("The size of the trajectory dataset: {}".format(len(grid_traj_dataset)))
         print("Avg. grid number of each trajetory: {:.4f}".format(grid_len / len(grid_traj_dataset)))
         return grid_traj_dataset, int(grid_len / len(grid_traj_dataset))
-
-
-def write_samples(saved_root, samples, lineage, **kwargs):
-    file_name = "samples-{}sample-{}grid-{}contain.txt".format(
-        int(kwargs["ratio_samples"]),
-        kwargs["num_grids"],
-        kwargs["contain"]
-    )
-    saved_path = os.path.join(saved_root, file_name)
-
-    with open(saved_path, 'w') as saved_file:
-        saved_file.write("Number of samples: {}\tGrid resolution: {}\tContainment: {}\n"
-                         .format(int(kwargs)kwargs["num_samples"], kwargs["num_grids"], kwargs["contain"]))
-        saved_file.write("Cluster timing: {:.4f}sec\tAlias sample timing: {:.4f}sec\n"
-                         .format(kwargs["cluster_time"], kwargs["sample_time"]))
-        saved_file.write("sampled trajectory distribution:\n")
-        saved_file.write(str(lineage) + "\n")
-        saved_file.write("sampled trajectory id:\n")
-        for traj_id in samples:
-            line = "{}\n".format(traj_id)
-            saved_file.write(line)
 
 
 def traj_cluster(traj_dataset: List[Trajectory], containment: int):
@@ -210,7 +189,7 @@ class AliasMethod:
 
 def write_samples(saved_root, samples, lineage, **kwargs):
     file_name = "samples-{}sample-{}grid-{}contain.txt".format(
-        int(kwargs["ratio_samples"]),
+        kwargs["ratio_samples"],
         kwargs["num_grids"],
         kwargs["contain"]
     )
