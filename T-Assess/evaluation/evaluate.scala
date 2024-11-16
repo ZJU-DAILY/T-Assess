@@ -1,16 +1,13 @@
 package evaluation
 
 import java.util.Date
-import scala.collection.mutable
-import scala.collection.mutable.ListBuffer
-import scala.math.max
-import scala.math.min
-import com.esri.core.geometry.Point
-import org.apache.spark.rdd.RDD
-import org.apache.commons.cli.Option
-import org.apache.commons.cli.Options
+import java.io.File
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.util.stream.Collectors
 import org.apache.spark.SparkConf
 import org.apache.spark.SparkContext
+import org.apache.spark.storage.StorageLevel
 import org.apache.spark.streaming.Milliseconds
 import org.apache.spark.streaming.StreamingContext
 import org.apache.spark.streaming.kafka010._
@@ -19,595 +16,398 @@ import org.apache.kafka.common.serialization.StringDeserializer
 import validity._
 import completeness._
 import consistency._
-import fairness._
 import kit._
-import util._
 
 object evaluate {
-  //------------------------------------------------config------------------------------------------------//
-  // define arg option
-  val dataset = Option.builder("dataset").argName("dataset").desc("string, url for dataset").build()
-  val query = Option.builder("query").argName("query").desc("string, url for query.json").build()
-  val bfmap = Option.builder("bfmap").argName("bfmap").desc("string, url for *.bfmap").build()
-  val geobound = Option.builder("geobound").argName("geobound").desc("tuple4, geography bound").build()
-  val sample = Option.builder("sample").argName("sample").desc("boolean, if evaluate sampled dataset").build()
-  val token = Option.builder("token").argName("token").desc("boolean, true for online evaluation and false for offline evaluation").build()
-  val asp = Option.builder("asp").argName("asp").desc("int, average sampling period (offline)").build()
-  val atl = Option.builder("atl").argName("atl").desc("int, average trajectory length (offline)").build()
-  // create options
-  val options = new Options()
-  options.addOption(dataset)
-  options.addOption(query)
-  options.addOption(bfmap)
-  options.addOption(geobound)
-  options.addOption(sample)
-  options.addOption(token)
-  options.addOption(asp)
-  options.addOption(atl)
-
-  val kafka_params = Map[String, Object](
-    "bootstrap.servers" -> "localhost:9092",
-    "key.deserializer" -> classOf[StringDeserializer],
-    "value.deserializer" -> classOf[StringDeserializer],
-    "group.id" -> "traQA_group"
-  )
-  val topics = Array("traQA_sender")
-
-  val time_window = 60000
-  val wds_max = 10
-
-  // parameters setting
-  //  val col_num = 5 // GMT, longitude, latitude, trajectory id, point id
-  val cap = 10000 // maximum number of points in leaf node in quad-tree original: 3000
-  val order = 5 // the branching factor (maximum number of branches in an internal node) of the B+-tree
-  val p1 = 10 // coefficient, get maximum interval between two consecutive points for segmentation purpose
-  val p2 = 0.01 // coefficient, get minimum trajectory length threshold
-
-  val eps = 50 // stop detection
-  val min_time = 2000 // stop detection
-  val min_pts = 50 // minimum points a stop contains
-  val pct_ap = 0.6
-  val dcc_ap = 0.8
-  val height = 3 // hierarchy height (atom level except)
-  val gran = Array[Int](100, 500, 1000) // hierarchy distance granularity
-
-  // bounds
-  var len_lower_bound = 0.0
-  var interval_upper_bound = 0.0
-  var geo_bound: Box = _
-
-  // map matcher
-  var matcher: BroadcastMatcher = _
-
-  // fairness relevant
-  var trqRDD: RDD[TimeSpan] = _ // temporal range query
-  var grqRDD: RDD[Box] = _ // geography range query
-
-  //------------------------------------------------statistics------------------------------------------------//
-  // dataset total trajectories & points
-  var dt_cnt = 0
-  var dp_cnt = 0L
-
-  // qualified total trajectories & points (construct index)
-  var qt_cnt = 0
-  var qp_cnt = 0L
-
-  // streaming trajectories & cumulative total points
-  var st_cnt = 0
-  var sp_cnt = 0L
-
-  // dataset spatial range
-  var dss_bound: Box = _
-  // dataset temporal range
-  var dst_bound: TimeSpan = _
-
-  // index
-  var quad_tree: QuadTree = _
-  var BPlus_trees: Array[(MemoryBPlusTree[(Long, Long), Any], TimeSpan)] = _
-  var segment_tree: SegmentTree = _
-
-  // hierarchical stay point
-  var hierarchy_stops = ListBuffer[Array[(Array[(GPS, Triplet)], Point)]]()
-
-  // validity
-  val isInRange_tids = mutable.Set[Int]()
-  val isOrderConstraint_tids = mutable.Set[Int]()
-  val isOutOfBound_tids = mutable.Set[Int]()
-
-  // completeness
-  val hasMP_tids = mutable.Set[Int]() // trajectory id unsatisfying constraint
-  var hasMP_pcnt = 0L // total missing GPS point
-
-  // consistency
-  val isRN_tids = mutable.Set[Int]()
-  val isSC_tids = mutable.Set[Int]()
-  val isTO_tids = mutable.Set[Int]()
-  val isTLC_tids = mutable.Set[Int]()
-  val isPSM_tids = mutable.Set[Int]()
-  val isRN_pids = mutable.Set[Long]() // GPS point id unsatisfying constraint
-  val isSC_pids = mutable.Set[Long]()
-  val isTO_pids = mutable.Set[Long]()
-  val isTLC_pids = mutable.Set[Long]()
-  val isPSM_pids = mutable.Set[Long]()
-
-  // data structure
-  val lens = mutable.Map[Int, Double]() // isTLC online
-  val idles = mutable.Map[Int, Int]() // isTLC online
-
-  // fairness
-  val isSpatialUniform_den = mutable.Map[Box, Double]() // density corresponding to query content
-  val isTemporalUniform_den = mutable.Map[TimeSpan, Double]()
-
-  //------------------------------------------------offline------------------------------------------------//
-  private def offlineEval(sc: SparkContext, url: String, sample:Boolean): Unit = {
-    println(timestamp2string(new Date().getTime) + " *** turn dataset into RDD & get total trajectories and points")
-    var recordRDD = sc.textFile(url, minPartitions = 1)
-      .map(x => x.split(","))
-      .map(y => (GPS(y(1).toDouble, y(2).toDouble), Triplet(y(0), y(3).toInt, y(4).toLong)))
-    if (sample) {
-      val lastIndex = url.lastIndexOf("/")
-      val path = url.substring(0, lastIndex + 1) + "samples.txt"
-      val samples = sc.textFile(path)
-        .map(x => (x.toInt, true))
-        .collect()
-        .toMap
-      recordRDD = recordRDD
-        .filter(x => samples.contains(x._2.traj_id))
+  private def offlineEval(sc: SparkContext, items: Map[String, String]): Unit = {
+    printf("%s *** processing %s\n", util.timestamp2string(new Date().getTime), items("dataset"))
+    var trajRDD = sc.wholeTextFiles(items("dataset"), minPartitions = variables.num_partition).map(_._2.split("\n").map(_.split(",")).map(x => (GPS(x(1).toDouble, x(2).toDouble), Triplet(x(0), x(3).toInt, x(4).toLong)))) // x(1)-longitude x(2)-latitude)
+      .map(_.iterator.toIterable)
+      //.sample(withReplacement = false, fraction = 0.01, seed = 1)
+    if (items("sample") != "") {
+      val ids = Files.lines(Paths.get(items("sample"))).skip(5).collect(Collectors.toList())
+      trajRDD = trajRDD.filter(x => ids.contains(x.head._2.tid.toString))
     }
-    recordRDD.cache()
-    dt_cnt = recordRDD
-      .map(x => x._2.traj_id)
-      .distinct()
-      .count().toInt
-    dp_cnt = recordRDD
-      .count()
-    println(" *** " + dt_cnt + " trajectories")
-    println(" *** " + dp_cnt + " points")
+    trajRDD.persist(StorageLevel.MEMORY_ONLY)
+    val pointRDD = trajRDD.flatMap(x => x).persist(StorageLevel.MEMORY_ONLY)
 
-    println(timestamp2string(new Date().getTime) + " *** evaluate & filter trajectory with isInRange")
-    val resRDD_isInRange = recordRDD
-      .map(x => (x, isInRange.eval(x)))
-      .cache()
-    isInRange_tids.addAll(resRDD_isInRange.filter(!_._2).map(x => x._1._2.traj_id).collect())
-    val qualifiedRDD1 = resRDD_isInRange
-      .filter(_._2)
-      .map(y => y._1)
-      .cache()
-    val cnt1 = qualifiedRDD1.count()
-    println(" *** filter " + (dp_cnt - cnt1) + " points")
+//    var recordRDD = sc.textFile(items("dataset"), minPartitions = variables.num_partition).map(_.split(","))
+//      .map(x => (GPS(x(1).toDouble, x(2).toDouble), Triplet(x(0), x(3).toInt, x(4).toLong))) // x(1)-longitude x(2)-latitude
+//      .persist(StorageLevel.MEMORY_ONLY)
+//    if (items("sample") != "") {
+//      val ids = Files.lines(Paths.get(items("sample"))).skip(5).collect(Collectors.toList())
+//      recordRDD = recordRDD.filter(x => ids.contains(x._2.tid.toString))
+//    }
+//    val trajRDD = recordRDD/*.coalesce(1)*/
+//      .groupBy(_._2.tid).map(_._2)
+//      //.repartition(variables.num_partition)
+//      //.sample(withReplacement = false, fraction = 0.01, seed = 1)
+//      .persist(StorageLevel.MEMORY_ONLY)
 
-    println(timestamp2string(new Date().getTime) + " *** evaluate & filter trajectory with isOutOfBound")
-    val a1 = geo_bound
-    val resRDD_isOutOfBound = qualifiedRDD1
-      .map(x => (x, isOutOfBound.eval(x, a1)))
-      .cache()
-    isOutOfBound_tids.addAll(resRDD_isOutOfBound.filter(!_._2).map(x => x._1._2.traj_id).collect())
-    val qualifiedRDD2 = resRDD_isOutOfBound
-      .filter(_._2)
-      .map(y => y._1)
-      .cache()
-    val cnt2 = qualifiedRDD2.count()
-    println(" *** filter " + (cnt1 - cnt2) + " points")
+    println(util.timestamp2string(new Date().getTime) + " *** Statistics")
+    variables.t_num = trajRDD.count().toInt
+    variables.p_num = pointRDD.count()
+    printf(" *** %d trajectories\n", variables.t_num)
+    printf(" *** %d points\n", variables.p_num)
 
-    println(timestamp2string(new Date().getTime) + " *** split trajectory according to time interval & space span")
-    val a2 = interval_upper_bound
-    val splitRDD = qualifiedRDD2
-      .map(x => (x._2.traj_id, x))
-      .groupByKey()
-      .map(y => segment(y._2.toArray, a2))
-      .flatMap(z => z)
-      .cache()
-    println(" *** " + splitRDD.count() + " sub trajectories")
+    val validity_start_time = new Date().getTime
+    printf("%s *** Evaluate with isInRange\n", util.timestamp2string(validity_start_time))
+    val isInRange_result = trajRDD.filter(isInRange.eval).map(_.head._2.tid)
+    variables.isInRange_tids.addAll(isInRange_result.collect())
+    printf(" *** %d trajectories violate isInRange\n", variables.isInRange_tids.size)
 
-    println(timestamp2string(new Date().getTime) + " *** evaluate & filter trajectory with isOrderConstraint")
-    val resRDD_isOrderConstraint = splitRDD
-      .map(x => (x, isOrderConstraint.eval(x)))
-      .cache()
-    isOrderConstraint_tids.addAll(resRDD_isOrderConstraint.filter(!_._2).map(x => x._1.head._2.traj_id).collect())
-    val qualifiedRDD3 = resRDD_isOrderConstraint
-      .filter(_._2)
-      .map(y => y._1)
-      .cache()
-    val cnt3 = qualifiedRDD3.count()
-    println(" *** filter " + (splitRDD.count() - cnt3) + " sub trajectories")
+    printf("%s *** Evaluate with isOrderConstraint\n", util.timestamp2string(new Date().getTime))
+    val isOrderConstraint_result = trajRDD.filter(isOrderConstraint.eval).map(_.head._2.tid)
+    variables.isOrderConstraint_tids.addAll(isOrderConstraint_result.collect())
+    printf(" *** %d trajectories violate isOrderConstraint\n", variables.isOrderConstraint_tids.size)
+    printf("Elapsed time for validity: %.3fs\n", (new Date().getTime - validity_start_time) / 1000.0)
 
-    println(timestamp2string(new Date().getTime) + " *** update trajectory id and point id & get total qualified trajectories and points & get dataset bounds")
-    val updateRDD = qualifiedRDD3
-      .zipWithIndex()
-      .map(x => x._1.map(i => (i._1, Triplet(i._2.GMT, x._2.toInt, i._2.poi_id))))
-      .repartition(500)
-      .cache()
-    qt_cnt = updateRDD
-      .count().toInt
-    val flatRDD = updateRDD
-      .flatMap(x => x)
-      .zipWithIndex()
-      .map(y => (y._1._1, Triplet(y._1._2.GMT, y._1._2.traj_id, y._2)))
-      .cache()
-    qp_cnt = flatRDD
-      .count()
-    println(" *** " + qt_cnt + " qualified trajectories")
-    println(" *** " + qp_cnt + " qualified points")
-    val GMTRDD = flatRDD
-      .map(x => x._2.GMT)
-      .cache()
-    dst_bound = TimeSpan(string2timestamp(GMTRDD.min), string2timestamp(GMTRDD.max))
-    val lonRDD = flatRDD
-      .map(y => y._1.getLon)
-      .cache()
-    val latRDD = flatRDD
-      .map(y => y._1.getLat)
-      .cache()
-    dss_bound = Box(lonRDD.min, latRDD.max, lonRDD.max, latRDD.min)
-
-    println(timestamp2string(new Date().getTime) + " *** evaluate qualified trajectories with hasMP")
-    val hasMPRDD = updateRDD
-      .map(x => (x, hasMP.evalOff(x)))
+    val completeness_start_time = new Date().getTime
+    printf("%s *** Evaluate with hasMP\n", util.timestamp2string(completeness_start_time))
+    val items_broadcast = sc.broadcast(items)
+    val hasMP_result = trajRDD.map(x => (x.head._2.tid, hasMP.eval(x, items_broadcast.value("mode") != "stream")))
+      .map(y => (y._1, y._2._1))
       .filter(_._2 != 0)
-      .cache()
-    hasMP_tids.addAll(hasMPRDD.map(x => x._1.head._2.traj_id).collect())
-    hasMP_pcnt += hasMPRDD.map(x => x._2.toLong).collect().sum
+      .persist(StorageLevel.MEMORY_ONLY)
+    variables.hasMP_tids.addAll(hasMP_result.map(_._1).collect())
+    variables.hasMP_pcnt = hasMP_result.map(_._2).sum().toLong
+    printf(" *** %d trajectories violate hasMP\n", variables.hasMP_tids.size)
+    printf("Elapsed time for completeness: %.3fs\n", (new Date().getTime - completeness_start_time) / 1000.0)
 
-    println(timestamp2string(new Date().getTime) + " *** evaluate qualified trajectories with isTLC")
-    val a3 = len_lower_bound
-    val isTLCRDD = updateRDD
-      .map(x => (x, isTLC.evalOff(x, a3)))
-      .filter(!_._2)
-      .map(y => y._1)
-      .cache()
-    isTLC_tids.addAll(isTLCRDD.map(x => x.head._2.traj_id).collect())
-    isTLC_pids.addAll(isTLCRDD.flatMap(x => x.map(y => y._2.poi_id)).collect())
+    val consistency_start_time = new Date().getTime
+    printf("%s *** Evaluate with isTLC\n", util.timestamp2string(consistency_start_time))
+    val traj_len = trajRDD.map(x => (x.head._2.tid, isTLC.eval(x))).collect()
+    val len_cal = traj_len.map(_._2)
+    val mean = len_cal.sum / len_cal.length
+    val std = math.sqrt(len_cal.map(x => math.pow(x - mean, 2)).sum / len_cal.length)
+    printf(" *** length mean - %f, std - %f\n", mean, std)
+    val length_thresh = math.max(0, mean - 3 * std)
+    val isTLC_result = traj_len.filter(x => x._2 < length_thresh).map(_._1)
+    variables.isTLC_tids.addAll(isTLC_result)
+    printf(" *** %d trajectories violate isTLC\n", variables.isTLC_tids.size)
 
-    println(timestamp2string(new Date().getTime) + " *** evaluate qualified trajectories with isRN")
-//    val map_matcher = sc.broadcast(matcher)
-//    val res_isRN = updateRDD
-//      .map(x => (x, isRN.evalOff(x, map_matcher)))
-//      .filter(!_._2._1)
-//      .map(y => (y._1, y._2._2))
-//      .cache()
-//    isRN_tids.addAll(res_isRN.map(x => x._1.head._2.traj_id).collect())
-//    isRN_pids.addAll(res_isRN.flatMap(x => x._2).collect())
-
-
-    println(timestamp2string(new Date().getTime) + " *** get possible stops")
-    val stopsRDD = updateRDD
-      .map(x => isSC.detectStopWithGeoOff(x))
-      .flatMap(y => y)
-      .cache()
-    println(" *** " + stopsRDD.count() + " possible stops")
-
-    println(timestamp2string(new Date().getTime) + " *** construct stop hierarchy and tell outliers")
-    val psRDD_index = stopsRDD
-      .map(x => (x, x.length >= min_pts && isSC.calculatePCT(x)))
-      .filter(_._2)
-      .map(y => (y._1, isSC.centerPoint(y._1)))
-      .zipWithIndex()
-      .cache()
-    val batch100 = 100
-    var s0 = 0
-    var e0 = batch100
-    var temp = Array[(Array[(GPS, Triplet)], Point)]()
-    while (s0 < psRDD_index.count()) {
-      val batch = psRDD_index
-        .filter(x => x._2 >= s0 && x._2 < e0)
-        .map(y => y._1)
-        .collect()
-      temp = temp.appendedAll(batch)
-      s0 = e0
-      e0 = s0 + batch100
-    }
-    evaluate.hierarchy_stops.append(temp)
-//    println(" *** level 0: " + evaluate.hierarchy_stops.head.length + " atom stops")
-    isSC.hierarchyDiscover(evaluate.hierarchy_stops.head, 1)
-    val isSCRDD = sc.makeRDD(hierarchy_stops.last.map(x => x._1))
-      .map(x => x.map(y => (y._2.traj_id, y._2.poi_id)).groupBy(_._1))
-      .filter(_.size == 1)
-      .cache()
-    isSC_tids.addAll(isSCRDD.flatMap(x => x.keys).collect())
-    isSC_pids.addAll(isSCRDD.flatMap(x => x.values.flatMap(y => y.map(z => z._2))).collect())
-
-    println(timestamp2string(new Date().getTime) + " *** kalman filter noise detecting")
-//    isPSM.evalOff()
-
-    println(timestamp2string(new Date().getTime) + " *** get edge trajectories and tell outliers")
-//    isTO.evalOff()
-//    println(" *** " + isTO.cnt + " edge trajectories")
-
-    println(timestamp2string(new Date().getTime) + " *** construct quad-tree index")
-    val flatRDD_index = flatRDD
-      .zipWithIndex()
-      .cache()
-    val batch10000 = 10000
-    var s1 = 0
-    var e1 = batch10000
-    while (s1 < flatRDD.count()) {
-      val batch = flatRDD_index
-        .filter(x => x._2 >= s1 && x._2 < e1)
-        .map(y => y._1)
-        .collect()
-      quad_tree.build(batch)
-      s1 = e1
-      e1 = s1 + batch10000
+    if (items("bfmap") != "") {
+      printf("%s *** Evaluate with isRN\n", util.timestamp2string(new Date().getTime))
+      // TODO: 集群情况下有些节点的matcher为null
+      val matcher_broadcast = sc.broadcast(variables.map_matcher)
+      val isRN_result = trajRDD.map(x => (x.head._2.tid, isRN.evalOff(x, matcher_broadcast.value))).filter(_._2.nonEmpty).persist(StorageLevel.MEMORY_ONLY)
+      variables.isRN_tids.addAll(isRN_result.map(_._1).collect())
+      variables.isRN_pids.addAll(isRN_result.flatMap(_._2).collect())
+      printf(" *** %d trajectories violate isRN\n", variables.isRN_tids.size)
+      //printf(" *** %d points violate isRN\n", variables.isRN_pids.size)
     }
 
-    println(timestamp2string(new Date().getTime) + " *** construct BPlus-tree per node")
-    BPlus_trees = quad_tree.dfsBPlusTree(order)
-    println(" *** " + BPlus_trees.length + " valid quad-tree leaves")
+    printf("%s *** Evaluate with isSC\n", util.timestamp2string(new Date().getTime))
+    val slow_point_thresh_broadcast = sc.broadcast(variables.slow_point_thresh)
+    val min_time_broadcast = sc.broadcast(variables.min_time)
+    val eps_broadcast = sc.broadcast(variables.eps)
+    val ps = trajRDD.map(isSC.trajDBSCAN(_, slow_point_thresh_broadcast.value, min_time_broadcast.value, eps_broadcast.value)).flatMap(x => x).collect()
+    val isSC_result = isSC.clusterPS(ps, variables.cluster_eps).filter(x => x.map(_._1).distinct.length == 1)
+    variables.isSC_tids.addAll(isSC_result.flatMap(x => x.map(y => y._1)))
+    variables.isSC_pids.addAll(isSC_result.flatMap(x => x.map(y => y._2)))
+    printf(" *** %d trajectories violate isSC\n", variables.isSC_tids.size)
+    //printf(" *** %d points violate isSC\n", variables.isSC_pids.size)
 
-    println(timestamp2string(new Date().getTime) + " *** construct segment-tree index")
-    segment_tree = new SegmentTree(dst_bound, BPlus_trees)
+    printf("%s *** Evaluate with isPSM\n", util.timestamp2string(new Date().getTime))
+    val σ_broadcast = sc.broadcast(variables.σ)
+    val σ_s_broadcast = sc.broadcast(variables.σ_s)
+    val deviation_broadcast = sc.broadcast(variables.deviation)
+    val isPSM_result = trajRDD.map(x => (x.head._2.tid, isPSM.kalmanFilter(x, σ_broadcast.value, σ_s_broadcast.value, deviation_broadcast.value))).filter(_._2.nonEmpty).persist(StorageLevel.MEMORY_ONLY)
+    variables.isPSM_tids.addAll(isPSM_result.map(_._1).collect())
+    variables.isPSM_pids.addAll(isPSM_result.flatMap(_._2).collect())
+    printf(" *** %d trajectories violate isPSM\n", variables.isPSM_tids.size)
+    //printf(" *** %d points violate isPSM\n", variables.isPSM_pids.size)
 
-    println(timestamp2string(new Date().getTime) + " *** do spatial sparseness query")
-    val a4 = grqRDD
-    val b4 = sc.broadcast(quad_tree)
-    val c4 = qp_cnt
-    val d4 = geo_bound
-    val res_isSpatialUniform = isSpatialUniform.eval(a4, b4, c4, d4)
-    isSpatialUniform_den.addAll(res_isSpatialUniform)
+    // TODO: 若需要warn的信息，修改/home/wt/spark/conf/log4j2.properties的日志等级
+    printf("%s *** Evaluate with isTO\n", util.timestamp2string(new Date().getTime))
+    val geo_bound_broadcast = sc.broadcast(variables.geo_bound)
+    val traj_with_coarse_segment = trajRDD.map(x => (x.head._2.tid, x.map(y => isTO.grid(y._1, geo_bound_broadcast.value))))
+      .map(z => (z._1, isTO.createCoarseSegments(z._2.toArray, z._1)))
+      .persist(StorageLevel.MEMORY_ONLY)
+    val traj_distance = traj_with_coarse_segment.map(x => (x._1, x._2.map(_.len).sum)).collect().toMap
+    val coarse_segments = traj_with_coarse_segment.flatMap(_._2).zipWithIndex()
+      // TODO: 可替代的加速方法
+      .sample(withReplacement = false, fraction = 0.1, seed = 1)
+      .coalesce(math.sqrt(variables.num_partition).toInt)
+      .persist(StorageLevel.MEMORY_ONLY)
+    coarse_segments.count()
+    val pairs = coarse_segments.cartesian(coarse_segments).filter(x => x._1._1.tid != x._2._1.tid && x._1._2 < x._2._2).map(y => (y._1._1,y._2._1 ))
+    val D_broadcast = sc.broadcast(variables.D)
+    val w_per_broadcast = sc.broadcast(variables.w_per)
+    val w_pral_broadcast = sc.broadcast(variables.w_pral)
+    val w_ang_broadcast = sc.broadcast(variables.w_ang)
+    val CLS = pairs.map(x => isTO.calculateCL(x._1, x._2, D_broadcast.value, w_per_broadcast.value, w_pral_broadcast.value, w_ang_broadcast.value))
+      .flatMap(y => y).reduceByKey(_ ++ _)
+    val F_broadcast = sc.broadcast(variables.F)
+    val t_num_broadcast = sc.broadcast(variables.t_num)
+    val P_broadcast = sc.broadcast(variables.P)
+    val isTO_result = CLS.map(x => ((x._1.len, x._1.tid), x._2))
+      .filter(y => isTO.fineSegmentOutlier(y._1._1, y._2, t_num_broadcast.value, P_broadcast.value))
+      .map(z => (z._1._2, z._1._1))
+      .reduceByKey(_ + _).filter(i => i._2/ traj_distance(i._1) >= F_broadcast.value)
+      .map(_._1)
+    variables.isTO_tids.addAll(isTO_result.collect())
+    printf(" *** %d trajectories violate isTO\n", variables.isTO_tids.size)
+    printf("Elapsed time for consistency: %.3fs\n", (new Date().getTime - consistency_start_time) / 1000.0)
 
-    println(timestamp2string(new Date().getTime) + " *** do temporal sparseness query")
-//    val a5 = trqRDD
-//    val b5 = sc.broadcast(segment_tree)
-//    val c5 = sc.broadcast(BPlus_trees)
-//    val d5 = qp_cnt
-//    val e5 = dst_bound
-//    val res_isTemporalUniform = isTemporalUniform.eval(a5, b5, c5, d5, e5)
-//    isTemporalUniform_den.addAll(res_isTemporalUniform)
+//    val fairness_start_time = new Date().getTime
+//    printf("%s *** Construct Index\n", util.timestamp2string(new Date().getTime))
+//    val cap_broadcast = sc.broadcast(variables.cap)
+//    val quad_trees = pointRDD.mapPartitions(iter => {
+//      val qt = new QuadTree(cap_broadcast.value, geo_bound_broadcast.value)
+//      qt.build(iter.to(Iterable))
+//      Iterator(qt)
+//    }).persist(StorageLevel.MEMORY_ONLY)
+//    val GMTs = pointRDD.map(x => util.string2timestamp(x._2.GMT))
+//    variables.time_bound = TimeSpan(GMTs.min(), GMTs.max)
+//    val order_broadcast = sc.broadcast(variables.order)
+//    val b_plus_trees = quad_trees.map(_.dfsBPlusTree(order_broadcast.value)).persist(StorageLevel.MEMORY_ONLY)
+//    b_plus_trees.count()
+//    // TODO: 确定是否还需要使用线段树
+//    //val segment_trees = b_plus_trees.map(x => new SegmentTree(x., x)).persist(StorageLevel.MEMORY_ONLY)
+//
+//    printf("%s *** Evaluate with isSpatialUniform\n", util.timestamp2string(fairness_start_time))
+//    var isSpatialUniform_result = Array[(Box, Double)]()
+//    for (box <- variables.boxs) {
+//      val cnt = quad_trees.map(_.rangeSearch(box).length.toDouble).sum()
+//      val i = (cnt / variables.p_num) * (variables.geo_bound.getArea / box.getArea)
+//      val density = i / (i + 1)
+//      isSpatialUniform_result :+= (box, density)
+//    }
+//    variables.isSpatialUniform_density.addAll(isSpatialUniform_result)
+//
+//    printf("%s *** Evaluate with isTemporalUniform\n", util.timestamp2string(new Date().getTime))
+//    var isTemporalUniform_result = Array[(TimeSpan, Double)]()
+//    for (span <- variables.timespan) {
+//      //val related =  segment_trees.map(x => (x._1.query(span.start / 1000, span.end / 1000), x._2))
+//      //val cnt = related.map(x => x._1.flatMap(y => x._2(y)._1.boundedKeysIterator((Symbol(">="), (span.start, -1)), (Symbol("<"), (span.end + 1, -1)))).size.toDouble).sum()
+//      val related =  b_plus_trees.flatMap(x => x).filter(_._2.overlap(span)).map(_._1)
+//      val cnt = related.flatMap(x => x.boundedKeysIterator((Symbol(">="), (span.start, -1)), (Symbol("<"), (span.end + 1, -1)))).count().toDouble
+//      val i = (cnt / variables.p_num) * (variables.time_bound.getInterval.toDouble / span.getInterval.toDouble)
+//      val density = i / (i + 1)
+//      isTemporalUniform_result :+= (span, density)
+//    }
+//    variables.isTemporalUniform_density.addAll(isTemporalUniform_result)
+//    printf("Elapsed time for fairness: %.3fs\n", (new Date().getTime - fairness_start_time) / 1000.0)
 
-    println(timestamp2string(new Date().getTime) + " *** done")
+    printf("%s *** done\n", util.timestamp2string(new Date().getTime))
   }
 
-  //------------------------------------------------online------------------------------------------------//
-  private val last_window = mutable.Map[Int, Array[(GPS, Triplet)]]()
-  private var start_time = 0: Long
-  private var end_time = 0: Long
-  private var delays = Array[Double]()
-  private val heaps = mutable.Map[Int, mutable.PriorityQueue[(Int, Int)]]() //hasMP
-  val groups = mutable.Map[Int, Array[(GPS, Triplet)]]() // isSC
-
-  private def onlineEval(ssc: StreamingContext, url: String, sample: Boolean): Unit = {
-    var window_cnt = 0
-
+  private def onlineEval(ssc: StreamingContext, items: Map[String, String]): Unit = {
+    val topics = Array("trajSender")
+    val kafka_params = Map[String, Object](
+      "bootstrap.servers" -> "localhost:9092",
+      "key.deserializer" -> classOf[StringDeserializer],
+      "value.deserializer" -> classOf[StringDeserializer],
+      "group.id" -> "traQA"
+    )
     val stream = KafkaUtils.createDirectStream[String, String](
       ssc,
       LocationStrategies.PreferConsistent,
       Subscribe[String, String](topics, kafka_params)
     )
-    val inputStream = stream.map(transform)
 
+    val inputStream = stream.map(_.value().split(","))
     inputStream.foreachRDD(RDD => {
-      window_cnt += 1
-      start_time = new Date().getTime
-      println("----------------------------------------\n" +
-        "Time: " + start_time + " ms\n" +
-        "----------------------------------------")
-      val in = RDD.count()
-      println(in)
-      if (in != 0) {
-//        sp_cnt += in
-//        if (st_cnt == 0) {
-//          val ids = RDD
-//            .map(x => x(3).toInt)
-//            .distinct()
-//            .collect()
-//          isTLC.initState(ids)
-//          isSC.initState(ids)
-//          st_cnt = ids.length
-//        }
-//
-//        val formatRDD = RDD
-//          .map(x => (GPS(x(1).toDouble, x(2).toDouble), Triplet(x(0), x(3).toInt, x(4).toLong)))
-//          .cache()
-//
-//        // isInRange
-//        val isInRangeRDD = formatRDD
-//          .map(x => (x, isInRange.eval(x)))
-//        isInRange_tids.addAll(isInRangeRDD.filter(!_._2).map(x => x._1._2.traj_id).distinct().collect())
-//
-//        // isOutOfBound
-//        val a1 = geo_bound
-//        val isOutOfBoundRDD = isInRangeRDD
-//          .map(x => (x._1, isOutOfBound.eval(x._1, a1)))
-//        isOutOfBound_tids.addAll(isOutOfBoundRDD.filter(!_._2).map(x => x._1._2.traj_id).distinct().collect())
-//
-//        val qualifiedRDD1 = isOutOfBoundRDD
-//          .filter(_._2)
-//          .map(z => (z._1._2.traj_id, z._1))
-//          .groupByKey()
-//          .map(i => (i._1, i._2.toArray.sortBy(_._2.poi_id)))
-//          .cache()
-//
-//        // isOrderConstraint
-//        val isOrderConstraintRDD = qualifiedRDD1
-//          .map(x => (x, isOrderConstraint.eval((if (last_window.contains(x._1)) Array(last_window(x._1).last) else Array()) ++ x._2)))
-//          .cache()
-//        isOrderConstraint_tids.addAll(isOrderConstraintRDD.filter(!_._2).map(x => x._1._1).collect())
-//        val qualifiedRDD2 = isOrderConstraintRDD
-//          .filter(_._2)
-//          .map(y => y._1)
-//          .cache()
-//
-//        val flatRDD = qualifiedRDD2
-//          .flatMap(x => x._2)
-//          .cache()
-//        qp_cnt += flatRDD.count()
-//
-//        val GMTs = flatRDD
-//          .map(x => x._2.GMT)
-//          .cache()
-//        if (dst_bound == null) {
-//          dst_bound = TimeSpan(string2timestamp(GMTs.min), string2timestamp(GMTs.max))
-//        } else {
-//          dst_bound = TimeSpan(min(dst_bound.start, string2timestamp(GMTs.min)), max(dst_bound.end, string2timestamp(GMTs.max)))
-//        }
-//        val lons = flatRDD
-//          .map(x => x._1.getLon)
-//          .cache()
-//        val lats = flatRDD
-//          .map(x => x._1.getLat)
-//          .cache()
-//        if (dss_bound == null) {
-//          dss_bound = Box(lons.min, lats.max, lons.max, lats.min)
-//        } else {
-//          dss_bound = Box(
-//            min(dss_bound.left_bound, lons.min),
-//            max(dss_bound.upper_bound, lats.max),
-//            max(dss_bound.right_bound, lons.max),
-//            min(dss_bound.lower_bound, lats.min)
-//          )
-//        }
-//
-//        quad_tree.build(flatRDD.collect())
-//        BPlus_trees = quad_tree.dfsBPlusTree(order)
-//        segment_tree = new SegmentTree(dst_bound, BPlus_trees)
-//
-//        // hasMP
-//        val intervalsRDD = qualifiedRDD2
-//          .map(x => (x._1, hasMP.getIntervals((if (last_window.contains(x._1)) Array(last_window(x._1).last) else Array()) ++ x._2)))
-//          .filter(_._2.nonEmpty)
-//          .cache()
-//        for (i <- intervalsRDD.collect()) {
-//          i._2.foreach(j => {
-//            if (!heaps.contains(i._1)) {
-//              heaps(i._1) = mutable.PriorityQueue[(Int, Int)]((1, j))
-//            } else {
-//              if (!heaps(i._1).exists(i => i._2 == j)) {
-//                heaps(i._1).enqueue((1, j))
-//              } else {
-//                var obj = (-1, -1)
-//                for (i <- heaps(i._1)) {
-//                  if (i._2 == j) obj = i
-//                }
-//                heaps(i._1) = heaps(i._1).filter(_._2 != j)
-//                heaps(i._1).enqueue((obj._1 + 1, obj._2))
-//              }
-//            }
-//          })
-//        }
-//        val a2 = heaps
-//        val hasMPRDD = intervalsRDD
-//          .map(x => (x._1, hasMP.getCnt(x._1, x._2, a2)))
-//          .filter(_._2 != 0)
-//          .cache()
-//        hasMP_tids.addAll(hasMPRDD.map(x => x._1).collect())
-//        hasMP_pcnt += hasMPRDD.map(x => x._2.toLong).collect().sum
-//
-//        // isTLC
-//        isTLC.updateState()
-//        val isTLCRDD = qualifiedRDD2
-//          .map(x => (x._1, isTLC.evalOn((if (last_window.contains(x._1)) Array(last_window(x._1).last) else Array()) ++ x._2)))
-//          .cache()
-//        for (i <- isTLCRDD.collect()) {
-//          evaluate.idles(i._1) = 0
-//          evaluate.lens(i._1) += i._2
-//        }
-//        isTLC.checkState()
-//
-//        // isRN
-//        val a3 = ssc.sparkContext.broadcast(matcher)
-//        val b3 = BroadcastMatcher.MatcherKStates
-//        val isRNRDD = qualifiedRDD2
-//          .map(x => (x._1, isRN.evalOn(x._2, a3, b3(x._1))))
-//          .cache()
-//        val mksRDD = isRNRDD
-//          .map(x => (x._1, x._2._3))
-//        for (i <- mksRDD.collect()) { BroadcastMatcher.MatcherKStates.update(i._1, i._2) }
-//        val isRNRDD_append = isRNRDD
-//          .filter(!_._2._1)
-//          .map(y => (y._1, y._2._2))
-//          .cache()
-//        isRN_tids.addAll(isRNRDD_append.map(x => x._1).collect())
-//        isRN_pids.addAll(isRNRDD_append.flatMap(x => x._2).collect())
-//
-//        // isSC
-//        val gs = groups
-//        val isSCRDD = qualifiedRDD2
-//          .map(x => (x._1, isSC.detectStopWithGeoOn(x._2, gs(x._1))))
-//          .cache()
-//        for (i <- isSCRDD.map(x => (x._1, x._2._2)).collect()) {
-//          groups.put(i._1, i._2)
-//        }
-//        val ps = isSCRDD
-//          .map(x => x._2._1)
-//          .flatMap(y => y)
-//          .map(z => (z, z.length >= min_pts && isSC.calculatePCT(z)))
-//          .filter(_._2)
-//          .map(i => (i._1, isSC.centerPoint(i._1)))
-//          .collect()
-//        evaluate.hierarchy_stops.append(ps)
-////        println(" *** level 0: " + evaluate.hierarchy_stops.head.length + " atom stops")
-//        isSC.hierarchyDiscover(evaluate.hierarchy_stops.head, 1)
-//        val levelRDD = ssc.sparkContext.makeRDD(hierarchy_stops.last.map(x => x._1))
-//          .map(x => x.map(y => (y._2.traj_id, y._2.poi_id)).groupBy(_._1))
-//          .filter(_.size == 1)
-//          .cache()
-//        isSC_tids.addAll(levelRDD.flatMap(x => x.keys).collect())
-//        isSC_pids.addAll(levelRDD.flatMap(x => x.values.flatMap(y => y.map(z => z._2))).collect())
-//
-//        // isPSM
-//        // isPSM.evalOn()
-//
-//        // isTO
-//        // isTO.evalOn()
-//
-//        val a4 = grqRDD
-//        val b4 = ssc.sparkContext.broadcast(quad_tree)
-//        val c4 = qp_cnt
-//        val d4 = geo_bound
-//        isSpatialUniform.eval(a4, b4, c4, d4)
-//        val a5 = trqRDD
-//        val b5 = ssc.sparkContext.broadcast(segment_tree)
-//        val c5 = ssc.sparkContext.broadcast(BPlus_trees)
-//        val d5 = qp_cnt
-//        val e5 = dst_bound
-//        isTemporalUniform.eval(a5, b5, c5, d5, e5)
-//
-//        display(token = true)
+      val start_time = new Date().getTime
+      printf("------------------------------------------------------------\nTime: %d ms\n------------------------------------------------------------\n", start_time)
 
-//        // cache the last window data
-//        last_window.addAll(qualifiedRDD1.collect())
+      // TODO: 分布式环境能访问kafka broker
+      if (!RDD.isEmpty()) {
+        variables.window_point_cnt :+= RDD.count()
+        printf(" *** %d points ***\n", variables.window_point_cnt.last)
+
+        val recordRDD = RDD.repartition(variables.num_partition)
+          .map(x => (GPS(x(1).toDouble, x(2).toDouble), Triplet(x(0), x(3).toInt, x(4).toLong)))
+          .persist(StorageLevel.MEMORY_ONLY)
+        val trajRDD = recordRDD.coalesce(1)
+          .groupBy(_._2.tid).map(_._2.toSeq.sortBy(_._2.pid))
+          .repartition(variables.num_partition)
+          .persist(StorageLevel.MEMORY_ONLY)
+        trajRDD.count()
+
+        val validity_start_time = new Date().getTime
+        printf("%s *** Evaluate with isInRange\n", util.timestamp2string(validity_start_time))
+        val isInRange_result = trajRDD.filter(isInRange.eval).map(_.head._2.tid)
+        variables.isInRange_tids.addAll(isInRange_result.collect())
+
+        printf("%s *** Evaluate with isOrderConstraint\n", util.timestamp2string(new Date().getTime))
+        val isOrderConstraint_result = trajRDD.filter(isOrderConstraint.eval).map(_.head._2.tid)
+        variables.isOrderConstraint_tids.addAll(isOrderConstraint_result.collect())
+        variables.validity_cost :+= (new Date().getTime - validity_start_time) / 1000.0
+
+        val completeness_start_time = new Date().getTime
+        printf("%s *** Evaluate with hasMP\n", util.timestamp2string(completeness_start_time))
+        val items_broadcast = ssc.sparkContext.broadcast(items)
+        val heaps = variables.heaps
+        val hasMP_result = trajRDD.map(x => (x.head._2.tid, hasMP.eval(x, items_broadcast.value("mode") != "stream", if (heaps(x.head._2.tid).isEmpty) 0 else heaps(x.head._2.tid).head._2))).persist(StorageLevel.MEMORY_ONLY)
+        val intervals = hasMP_result.map(x => (x._1, x._2._2)).collect()
+        for (pair <- intervals) {
+          for (time <- pair._2) {
+            if (!variables.heaps(pair._1).exists(_._2 == time)) {
+              variables.heaps(pair._1).enqueue((1, time))
+            } else {
+              val obj = variables.heaps(pair._1).filter(_._2 == time).head
+              variables.heaps(pair._1) = variables.heaps(pair._1).filter(_._2 != time)
+              variables.heaps(pair._1).enqueue((obj._1 + 1, obj._2))
+            }
+          }
+        }
+        variables.hasMP_tids.addAll(hasMP_result.filter(_._2._1 != 0).map(_._1).collect())
+        variables.hasMP_pcnt += hasMP_result.map(x => x._2._1).sum().toLong
+        variables.completeness_cost :+= (new Date().getTime - completeness_start_time) / 1000.0
+
+        val consistency_start_time = new Date().getTime
+        printf("%s *** Evaluate with isTLC\n", util.timestamp2string(consistency_start_time))
+        val isTLC_result = trajRDD.map(x => (x.head._2.tid, isTLC.eval(x)))
+        for (pair <- isTLC_result.collect()) {
+          variables.lens(pair._1) = variables.lens(pair._1) + pair._2
+        }
+
+        if (items("bfmap") != "") {
+          printf("%s *** Evaluate with isRN\n", util.timestamp2string(new Date().getTime))
+          val matcher_broadcast = ssc.sparkContext.broadcast(variables.map_matcher)
+          val matcherKStates = variables.matcherKStates
+          val isRN_result = trajRDD.map(x => (x.head._2.tid, isRN.evalOn(x, matcherKStates(x.head._2.tid), matcher_broadcast.value))).persist(StorageLevel.MEMORY_ONLY)
+          for (pair <- isRN_result.map(x => (x._1, x._2._2)).collect()) {
+            variables.matcherKStates(pair._1) = pair._2
+          }
+          variables.isRN_tids.addAll(isRN_result.filter(_._2._1.length > 0).map(_._1).collect())
+          variables.isRN_pids.addAll(isRN_result.flatMap(_._2._1).collect())
+        }
+
+        printf("%s *** Evaluate with isPSM\n", util.timestamp2string(new Date().getTime))
+        val σ_broadcast = ssc.sparkContext.broadcast(variables.σ)
+        val σ_s_broadcast = ssc.sparkContext.broadcast(variables.σ_s)
+        val deviation_broadcast = ssc.sparkContext.broadcast(variables.deviation)
+        val isPSM_result = trajRDD.map(x => (x.head._2.tid, isPSM.kalmanFilter(x, σ_broadcast.value, σ_s_broadcast.value, deviation_broadcast.value))).filter(_._2.nonEmpty).persist(StorageLevel.MEMORY_ONLY)
+        variables.isPSM_tids.addAll(isPSM_result.map(_._1).collect())
+        variables.isPSM_pids.addAll(isPSM_result.flatMap(_._2).collect())
+
+        printf("%s *** Evaluate with isSC\n", util.timestamp2string(new Date().getTime))
+        val stop_groups = variables.stop_groups
+        val eps_broadcast = ssc.sparkContext.broadcast(variables.eps)
+        val min_time_broadcast = ssc.sparkContext.broadcast(variables.min_time)
+        val ps_and_group = trajRDD.map(x => (x.head._2.tid, isSC.geoStopDetection(x.toArray, stop_groups(x.head._2.tid), eps_broadcast.value, min_time_broadcast.value))).persist(StorageLevel.MEMORY_ONLY)
+        for (i <- ps_and_group.map(x => (x._1, x._2._2)).collect()) {
+          variables.stop_groups.put(i._1, i._2)
+        }
+        variables.ps :++= ps_and_group.flatMap(x => x._2._1).collect()
+
+        printf("%s *** Evaluate with isTO\n", util.timestamp2string(new Date().getTime))
+        val geo_bound_broadcast = ssc.sparkContext.broadcast(variables.geo_bound)
+        val coarse_segments = trajRDD.map(x => (x.head._2.tid, x.map(y => isTO.grid(y._1, geo_bound_broadcast.value))))
+          .flatMap(z => isTO.createCoarseSegments(z._2.toArray, z._1)).zipWithIndex()
+          //.sample(withReplacement = false, fraction = 0.1, seed = 1)
+          .coalesce(math.sqrt(variables.num_partition).toInt)
+          .persist(StorageLevel.MEMORY_ONLY)
+        coarse_segments.count()
+        val pairs = coarse_segments.cartesian(coarse_segments)
+          .filter(x => x._1._1.tid != x._2._1.tid && x._1._2 < x._2._2).map(y => (y._1._1,y._2._1 ))
+        val D_broadcast = ssc.sparkContext.broadcast(variables.D)
+        val w_per_broadcast = ssc.sparkContext.broadcast(variables.w_per)
+        val w_pral_broadcast = ssc.sparkContext.broadcast(variables.w_pral)
+        val w_ang_broadcast = ssc.sparkContext.broadcast(variables.w_ang)
+        val t_num_broadcast = ssc.sparkContext.broadcast(variables.t_num)
+        val isTO_result = pairs.filter(x => isTO.dist(x._1.pointList.head, x._1.pointList.last, x._2.pointList.head, x._2.pointList.last, w_per_broadcast.value, w_pral_broadcast.value, w_ang_broadcast.value) > D_broadcast.value)
+          .flatMap(x => Seq((x._1.tid, x._2.tid), (x._2.tid, x._1.tid)))
+          .groupByKey()
+          .filter(_._2.size == t_num_broadcast.value)
+          .map(_._1)
+        variables.isTO_tids.addAll(isTO_result.collect())
+        variables.consistency_cost :+= (new Date().getTime - consistency_start_time) / 1000.0
+
+        val fairness_start_time = new Date().getTime
+        printf("%s *** Construct Index\n", util.timestamp2string(new Date().getTime))
+        variables.quad_tree_onlineEval.build(recordRDD.collect())
+        variables.fairness_cost :+= (new Date().getTime - fairness_start_time) / 1000.0
+
+        val end_time = new Date().getTime
+        val cost_time = end_time - start_time
+        val delay = cost_time - variables.time_window
+        variables.delays :+= (if (delay > 0) delay.toDouble / 1000 else 0.0)
+        printf(" *** %.2f seconds delay ***\n", variables.delays.last)
       }
-
-      end_time = new Date().getTime
-      val t = end_time - start_time - time_window
-      val delay = if (t > 0) t.toDouble / 1000 else 0.0
-      delays :+= delay
-      println("*** delay: " + "%.2f".format(delay) + " seconds ***")
-      println("*** average delay: " + delays.sum / (1000 * delays.length) + " seconds ***")
-      println("*** window cnt: " + window_cnt + " ***")
     })
 
     // start receiving data
     ssc.start()
-    snapshot.send(ssc.sparkContext, url, sample)
-    while (!snapshot.executor_service.isTerminated) { /* idle until all data are sent */ }
+    snapshot.send(ssc.sparkContext, items)
     ssc.stop(stopSparkContext = true, stopGracefully = true)
+
+    val t1 = new Date().getTime
+    val len_cal = variables.lens.values
+    val mean = len_cal.sum / len_cal.size
+    val std = math.sqrt(len_cal.map(x => math.pow(x - mean, 2)).sum / len_cal.size)
+    val length_thresh = math.max(0, mean - 3 * std)
+    val isTLC_result = variables.lens.filter(x => x._2 < length_thresh).keys
+    variables.isTLC_tids.addAll(isTLC_result)
+    variables.consistency_cost = variables.consistency_cost.map(_ + (new Date().getTime - t1) / (1000.0 * variables.consistency_cost.length)) // 评估长度不满足约束轨迹的时间平摊到每个时间片上
+
+    val t2 = new Date().getTime
+    val isSC_result = variables.ps.filter(x => x.length >= variables.min_pts && isSC.calculatePCT(x, variables.dcc_ap, variables.pct_ap))
+    variables.isSC_tids.addAll(isSC_result.map(_.head._2.tid))
+    variables.isSC_pids.addAll(isSC_result.flatMap(_.map(_._2.pid)))
+    variables.consistency_cost = variables.consistency_cost.map(_ + (new Date().getTime - t2) / (1000.0 * variables.consistency_cost.length))
+
+    val t3 = new Date().getTime
+    var isSpatialUniform_result = Array[(Box, Double)]()
+    for (box <- variables.boxs) {
+      val cnt = variables.quad_tree_onlineEval.rangeSearch(box).length.toDouble
+      val i = (cnt / variables.p_num) * (variables.geo_bound.getArea / box.getArea)
+      val density = i / (i + 1)
+      isSpatialUniform_result :+= (box, density)
+    }
+    variables.isSpatialUniform_density.addAll(isSpatialUniform_result)
+    var isTemporalUniform_result = Array[(TimeSpan, Double)]()
+    variables.bplus_tree_onlineEval = variables.quad_tree_onlineEval.dfsBPlusTree(variables.order)
+    for (span <- variables.timespan) {
+      val related =  variables.bplus_tree_onlineEval.filter(_._2.overlap(span)).map(_._1)
+      val cnt = related.flatMap(x => x.boundedKeysIterator((Symbol(">="), (span.start, -1)), (Symbol("<"), (span.end + 1, -1)))).length.toDouble
+      val i = (cnt / variables.p_num) * (variables.time_bound.getInterval.toDouble / span.getInterval.toDouble)
+      val density = i / (i + 1)
+      isTemporalUniform_result :+= (span, density)
+    }
+    variables.isTemporalUniform_density.addAll(isTemporalUniform_result)
+    variables.fairness_cost = variables.fairness_cost.map(_ + (new Date().getTime - t3) / (1000.0 * variables.fairness_cost.length)) // 查询时空密度时间平摊到每个时间片上
+
+    printf("\n============================== Statistics ==============================\n")
+    printf(" *** Average %d points ***\n", variables.window_point_cnt.sum / variables.window_point_cnt.length)
+    printf(" *** Average %.2f secs delay ***\n", variables.delays.sum / variables.delays.length)
+    printf("----------\n")
+    printf(" *** %d trajectories violate isInRange\n", variables.isInRange_tids.size)
+    printf(" *** %d trajectories violate isOrderConstraint\n", variables.isOrderConstraint_tids.size)
+    printf(" *** Average time of validity: %.3fs ***\n", variables.validity_cost.sum / variables.validity_cost.length)
+    printf("----------\n")
+    printf(" *** %d trajectories violate hasMP\n", variables.hasMP_tids.size)
+    printf(" *** Average time of completeness: %.3fs ***\n", variables.completeness_cost.sum / variables.completeness_cost.length)
+    printf("----------\n")
+    printf(" *** %d trajectories violate isTLC\n", variables.isTLC_tids.size)
+    if (items("bfmap") != "") {
+      printf(" *** %d trajectories violate isRN\n", variables.isRN_tids.size)
+    }
+    printf(" *** %d trajectories violate isSC\n", variables.isSC_tids.size)
+    printf(" *** %d trajectories violate isPSM\n", variables.isPSM_tids.size)
+    printf(" *** %d trajectories violate isTO\n", variables.isTO_tids.size)
+    printf(" *** Average time of consistency: %.3fs ***\n", variables.consistency_cost.sum / variables.consistency_cost.length)
+    printf("----------\n")
+    printf(" *** Average time of fairness: %.3fs ***\n", variables.fairness_cost.sum / variables.fairness_cost.length)
   }
 
   def main(args: Array[String]): Unit = {
-//    val conf = new SparkConf()
-//      .setAppName("traQA")
-//      .setMaster("spark://10.214.151.197:7077")
-//      .set("spark.jars", "/home/wt/code/traQA/trajectory-quality-assessment/out/artifacts/traQA_jar/traQA.jar")
-//      .set("spark.driver.host", "10.214.151.197")
-//      .set("spark.default.parallelism", "500")
-//      .set("spark.executor.memory", "20g")
-
-    val conf = new SparkConf()
-      .setAppName("traQA")
-      .setMaster("local[24]")
-
+    val conf = new SparkConf().setAppName("traQA")
     val sc = new SparkContext(conf)
 
-    val items = checkArgs(args)
-    init(sc, items)
-    val token = items("token").toBoolean
-    if (!token) {
-      offlineEval(sc, items("dataset"), items("sample").toBoolean)
-      display(token)
-    } else {
-      val ssc = new StreamingContext(sc, Milliseconds(time_window))
-      onlineEval(ssc, items("dataset"), items("sample").toBoolean)
+    val items = util.getArgs("config.properties")
+    util.variables_init(items)
+    if (items("mode") != "stream") {
+      offlineEval(sc, items)
+      util.display()
+    }
+    else {
+      val ssc = new StreamingContext(sc, Milliseconds(variables.time_window))
+      onlineEval(ssc, items)
+      util.display()
     }
   }
 }
