@@ -58,7 +58,7 @@ class QuadTree(K: Int, geoBound: Box) extends Serializable {
 
       def insertElement(): Boolean = {
         var returnValue = false  //Returns true if value actually inserted
-        if (!elements.exists(_.data.poi_id == elem.data.poi_id)) {
+        if (!elements.exists(_.data.pid == elem.data.pid)) {
           elements :+= elem
           returnValue = true
         }
@@ -66,14 +66,10 @@ class QuadTree(K: Int, geoBound: Box) extends Serializable {
         returnValue
       }
 
-      if (!bounds.contain(elem.position)) {
-        throw new IllegalArgumentException(s"The position '${elem.position}' is out of QuadTree bounds.")
-      }
+      if (!bounds.contain(elem.position)) return false
 
-      this.synchronized {
-        if (isLeaf) insertElement()
-        else findSubtree(elem.position).insert(elem)
-      }
+      if (isLeaf) insertElement()
+      else findSubtree(elem.position).insert(elem)
     }
 
     /**
@@ -121,7 +117,7 @@ class QuadTree(K: Int, geoBound: Box) extends Serializable {
         val index = new MemoryBPlusTree[(Long, Long), Any](order)
         if (elements.nonEmpty) {
           for (ele <- elements) {
-            index.insert((util.string2timestamp(ele.data.GMT), ele.data.poi_id))
+            index.insert((util.string2timestamp(ele.data.GMT), ele.data.pid))
           }
           Array((index, TimeSpan(index.minKey.get._1, index.maxKey.get._1)))
         } else {
